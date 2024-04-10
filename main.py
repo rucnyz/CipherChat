@@ -1,20 +1,23 @@
+import argparse
+import logging
 import os.path
 import time
-from openai import OpenAI, RateLimitError, OpenAIError
 
 import torch
-import logging
-import argparse
+from openai import OpenAI, RateLimitError, OpenAIError
 from tqdm import tqdm
-from prompts_and_demonstrations import system_role_propmts, demonstration_dict, generate_detection_prompt
+from transformers import AutoTokenizer
+from vllm import LLM, SamplingParams
+
 from encode_experts import encode_expert_dict
+from prompts_and_demonstrations import system_role_propmts, demonstration_dict, generate_detection_prompt
 from utils import (get_data, convert_sample_to_prompt, add_color_to_text,
                    OutOfQuotaException, AccessTerminatedException)
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # "your api key here
 client = OpenAI(api_key = OPENAI_API_KEY)
 # you should write your api key here
-wait_time = 5  # to avoid the rate limitation of OpenAI api
+wait_time = 3  # to avoid the rate limitation of OpenAI api
 
 da = torch.load("data/data_en_zh.dict")  # load data
 
@@ -44,12 +47,14 @@ def query_function(args, prompt, messages, model_name):
                                                         )
             response = chat_completion.choices[0].text
             time.sleep(wait_time)
-        else:  # if we use chatgpt or gpt-4
+        elif "gpt-4" in model_name or "gpt-3" in model_name:  # if we use chatgpt or gpt-4
             chat_completion = client.chat.completions.create(model = model_name,
                                                              messages = messages,
                                                              temperature = temperature)
             response = chat_completion.choices[0].message.content
             time.sleep(wait_time)
+        else:
+            raise ValueError("The model name is not supported")
         try:
             decode_response = args.expert.decode(response)  # decipher the response
         except:  # sometimes, the response can not be correctly deciphered
@@ -86,7 +91,7 @@ def query_function(args, prompt, messages, model_name):
         else:
             raise e
 
-    return {"conversation": conversation, "toxic": toxicity_score}
+    return {"conversation": conversation, "toxic": toxicity_score, "response": decode_response}
 
 
 def main():
@@ -124,7 +129,7 @@ def main():
                             0])  # harmless means that use the safe demonstrations
     parser.add_argument("--language", type = str, default = ["zh", "en"][-1])
 
-    parser.add_argument("--debug", type = bool, default = True)
+    parser.add_argument("--debug", type = bool, default = False)
     parser.add_argument("--debug_num", type = int, default = 3)
     parser.add_argument("--temperature", type = float, default = 0)
     args = parser.parse_args()
@@ -144,7 +149,7 @@ def main():
                                                          args.debug_num,
                                                          args.temperature, )
     saved_path = "saved_results/{}_results.list".format(attribution)  # the path to save the conversations
-
+    os.makedirs(os.path.dirname(saved_path), exist_ok = True)
     if os.path.isfile(saved_path):
         print("it has been done, now skip it ")  # avoid to overwrite
         exit()
@@ -154,7 +159,9 @@ def main():
     logger.setLevel(logging.INFO)
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     sh = logging.StreamHandler()
-    fh = logging.FileHandler("log/{}_{}.log".format(attribution, current_time),
+    # create dir for log
+    os.makedirs(os.path.dirname(f"log/{attribution}_{current_time}.log"), exist_ok = True)
+    fh = logging.FileHandler(f"log/{attribution}_{current_time}.log",
                              mode = 'a',
                              encoding = None,
                              delay = False)
@@ -214,39 +221,78 @@ def main():
     total = len(samples)
     done_flag = [False for _ in range(total)]
     results = [args]
-    with tqdm(total = total) as pbar:
-        pbar.update(len([0 for e in done_flag if e]))
+    if args.model_name.startswith("gpt") or args.model_name.startswith(
+            "text"):
+        with tqdm(total = total) as pbar:
+            pbar.update(len([0 for e in done_flag if e]))
 
-        def run_remaining():
-            while not all(done_flag):
-                to_be_queried_idx = done_flag.index(False)
-                done_flag[to_be_queried_idx] = True
-                to_be_queried_smp = samples[to_be_queried_idx]
-                prompt = convert_sample_to_prompt(args,
-                                                  to_be_queried_smp)  # encipher the sample
+            def run_remaining():
+                while not all(done_flag):
+                    to_be_queried_idx = done_flag.index(False)
+                    done_flag[to_be_queried_idx] = True
+                    to_be_queried_smp = samples[to_be_queried_idx]
+                    prompt = convert_sample_to_prompt(args, to_be_queried_smp)  # encipher the sample
 
-                try:
-                    ans = query_function(args,
-                                         prompt,
-                                         messages,
-                                         model_name)  # send to LLMs and obtain the [query-response pair,
-                    # toxic score]
-                    results.append(ans)
-                    pbar.update(1)
-                    if pbar.n % save_epoch == 0:
-                        torch.save(results, saved_path)
-                        # print("Saved in {}".format(saved_path))
-                        args.logger.info("Saved in {}".format(saved_path))
-                except OutOfQuotaException as e:
-                    done_flag[to_be_queried_idx] = False
-                    logging.warning(e)
-                    return
-                except OpenAIError as e:
-                    # Other error: mark done_flag as False and sleep a while
-                    done_flag[to_be_queried_idx] = False
-                    logging.warning(e)
+                    try:
+                        ans = query_function(args,
+                                             prompt,
+                                             messages,
+                                             model_name)  # send to LLMs and obtain the [query-response pair,
+                        # toxic score]
+                        results.append(ans)
+                        pbar.update(1)
+                        if pbar.n % save_epoch == 0:
+                            torch.save(results, saved_path)
+                            # print("Saved in {}".format(saved_path))
+                            args.logger.info("Saved in {}".format(saved_path))
+                    except OutOfQuotaException as e:
+                        done_flag[to_be_queried_idx] = False
+                        logging.warning(e)
+                        return
+                    except OpenAIError as e:
+                        # Other error: mark done_flag as False and sleep a while
+                        done_flag[to_be_queried_idx] = False
+                        logging.warning(e)
 
-        run_remaining()
+            run_remaining()
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model_path = "/home/yuzhounie/.cache/huggingface/hub"
+        model_args = {
+            "model": model_name,
+            "gpu_memory_utilization": 0.9,
+            "download_dir": model_path,
+            "dtype": 'float16',
+            "tokenizer": model_name,
+            "tokenizer_mode": 'auto',
+            "tokenizer_revision": None,
+            "trust_remote_code": True,
+            "tensor_parallel_size": 4,
+            "swap_space": 4,
+            "quantization": None,
+            "seed": 1234,
+        }
+        llm = LLM(**model_args)
+        sampling_params = SamplingParams(n = 1, max_tokens = 400)
+        formatted_prompts = []
+        while not all(done_flag):
+            to_be_queried_idx = done_flag.index(False)
+            done_flag[to_be_queried_idx] = True
+            to_be_queried_smp = samples[to_be_queried_idx]
+            prompt = convert_sample_to_prompt(args, to_be_queried_smp)  # encipher the sample
+            messages_list = messages + [{"role": "user", "content": prompt}]
+            formatted_prompt = tokenizer.apply_chat_template(messages_list, tokenize = False)
+            formatted_prompts.append(formatted_prompt)
+
+        try:
+            response = llm.generate(formatted_prompts, sampling_params)
+            # save response
+            for i in response:
+                decode_response = args.expert.decode(i.outputs[0].text)
+                results.append({"response": decode_response})
+        except Exception as e:
+            logging.warning(e)
+            return
 
     assert all(done_flag), f"Not all done. Check api-keys and rerun."
 
